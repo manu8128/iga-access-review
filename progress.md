@@ -50,12 +50,82 @@ tests/test_graph.py::test_campaign_runs_end_to_end PASSED   [1.91s]
 
 ---
 
-## Phase 3 — Harvester Agent (Planned)
-Implement real DB queries in `HarvesterAgent.run()`:
-- Join `Entitlement` → `User` → `Department`, `Manager`, `Resource`
-- Filter to `is_active=True` for the campaign scope
-- Return fully-populated dicts matching the `scored_entitlements` key contract
-  (all fields: `entitlement_id`, `user_name`, `manager_email`, `resource_sensitivity`, etc.)
-- Write `Campaign` record to DB with `status=HARVESTING`
-- Add `AuditLog` entry for harvest start/complete
-- Add corresponding pytest fixture and tests in `tests/test_harvester.py`
+## Phase 3 — Harvester + Rule-Based Risk Scorer ✅
+**Goal:** Replace Harvester and RiskScorer stubs with real implementations.
+No LLM calls — pure SQLAlchemy + rule-based scoring.
+
+### Files Modified / Created
+| File | Change |
+|------|--------|
+| `agents/harvester.py` | Full SQLAlchemy implementation replacing stub |
+| `agents/risk_scorer.py` | Rule-based scoring engine replacing stub |
+| `tests/test_harvester.py` | 3 DB-backed integration tests |
+| `tests/test_risk_scorer.py` | 7 pure-Python unit tests (no DB) |
+| `tests/test_graph.py` | Added integration test + updated stub assertions |
+| `pytest.ini` | Registered `stub` mark for graph skeleton tests |
+
+### HarvesterAgent Design
+- Single 4-table JOIN: `Entitlement → User → Resource → Department`
+  plus `OUTERJOIN` to aliased `User` for nullable `manager_id`
+- Creates `Campaign` record + 2 `AuditLog` entries per run
+- Full try/except/finally with rollback on error, always closes session
+- Returns 13 active entitlements from seed data
+
+### RiskScorerAgent Design — Scoring Rules
+
+| Factor | Points |
+|--------|--------|
+| resource_sensitivity: critical | +40 |
+| resource_sensitivity: high | +30 |
+| resource_sensitivity: medium | +15 |
+| resource_sensitivity: low | +5 |
+| Never used (last_used is None) | +30 |
+| Stale ≥ 180 days | +25 |
+| Stale ≥ 90 days | +15 |
+| Stale ≥ 30 days | +5 |
+| SoD violation (Finance + IT in same user) | +20 |
+| Role mismatch (Admin + Junior/Intern title) | +15 |
+| **Maximum (capped)** | **100** |
+
+Risk level thresholds (≥): `81=critical`, `61=high`, `31=medium`, `0=low`
+
+### Actual Risk Scores for Seed Red-Flag Entitlements
+
+| User | Resource | Score | Level | Flags |
+|------|----------|-------|-------|-------|
+| Bob Kumar | SAP Finance Admin | **80** | high | role_mismatch |
+| Bob Kumar | HRIS Full Access | **70** | high | *(none — "Full Access" ≠ Admin)* |
+| Dan Smith | AWS Production Admin | **80** | high | role_mismatch |
+| Frank Lee | SAP Finance Admin | **75** | high | sod_violation |
+| Frank Lee | AWS Production Admin | **60** | medium | sod_violation |
+
+### Test Results
+```
+12 passed in 0.66s
+
+tests/test_graph.py::test_campaign_runs_end_to_end            PASSED
+tests/test_graph.py::test_graph_with_real_harvester_and_scorer PASSED
+tests/test_harvester.py::test_harvester_returns_all_active_entitlements PASSED
+tests/test_harvester.py::test_harvester_creates_campaign_record PASSED
+tests/test_harvester.py::test_harvester_creates_audit_logs PASSED
+tests/test_risk_scorer.py::test_risk_scorer_scores_all_entitlements PASSED
+tests/test_risk_scorer.py::test_critical_resource_never_used_scores_high PASSED
+tests/test_risk_scorer.py::test_sod_violation_detected PASSED
+tests/test_risk_scorer.py::test_role_mismatch_detected PASSED
+tests/test_risk_scorer.py::test_score_capped_at_100 PASSED
+tests/test_risk_scorer.py::test_risk_scorer_handles_empty_entitlements PASSED
+tests/test_risk_scorer.py::test_risk_level_boundaries PASSED
+```
+
+---
+
+## Phase 4 — DecisionAgent (Planned)
+Replace `DecisionAgent` stub with real LLM-driven decision making:
+- Iterate `state["scored_entitlements"]`
+- Call Claude (via `self.llm`) with a structured prompt per entitlement:
+  risk_score, risk_level, flags, user context, resource sensitivity
+- Parse LLM response into: `ai_decision` (approve/revoke/escalate),
+  `ai_reasoning` (explanation string), `confidence` (float 0–1)
+- Populate `pending_human_review` for all `revoke` decisions
+- Write `EntitlementReview` rows to PostgreSQL
+- Add tests in `tests/test_decision.py` with prompt/response fixtures
