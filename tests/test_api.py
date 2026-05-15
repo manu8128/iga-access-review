@@ -184,3 +184,15 @@ def test_resume_campaign_success() -> None:
     assert data["campaign_id"] == "test-campaign-id"
     assert data["decision_count"] == 1
     assert "resuming" in data["message"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# GET /observability/status                                                    #
+# --------------------------------------------------------------------------- #
+
+def test_observability_status() -> None:
+    response = client.get("/observability/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert "langsmith_tracing" in data
+    assert "langsmith_project" in data

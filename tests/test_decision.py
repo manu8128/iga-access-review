@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -171,3 +171,29 @@ def test_decision_handles_invalid_decision_value() -> None:
     assert result["decisions"][0]["ai_decision"] == "escalate"
     # confidence carried through even on invalid decision
     assert result["decisions"][0]["confidence"] == 0.5
+
+
+def test_decision_retries_on_exception() -> None:
+    """LLM raises exceptions twice then succeeds — should succeed on third attempt."""
+    agent = DecisionAgent()
+    agent._db = MagicMock()
+    mock_campaign = MagicMock()
+    mock_campaign.id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    agent._db.query.return_value.filter.return_value.first.return_value = mock_campaign
+
+    mock_llm = MagicMock()
+    mock_llm.invoke.side_effect = [
+        Exception("connection timeout"),
+        Exception("rate limit"),
+        MagicMock(content='{"decision":"approve","reasoning":"ok","confidence":0.9}'),
+    ]
+    agent._llm = mock_llm
+
+    state = _make_state([_fake_scored_entitlement()])
+    # Patch time.sleep so the test does not wait 2+ seconds for backoff
+    with patch("agents.decision.time.sleep"):
+        result = agent.run(state)
+
+    assert mock_llm.invoke.call_count == 3
+    assert result["decisions"][0]["ai_decision"] == "approve"
+    assert result["decisions"][0]["confidence"] == 0.9

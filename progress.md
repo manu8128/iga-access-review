@@ -225,3 +225,60 @@ tests/test_audit.py          2 passed
 - `resume_campaign()` with `human_decision="approve"` for all revokes
 - Final `status="completed"`, `audit_complete=True`, `notified=True`
 - `Campaign.status == COMPLETED` and `completed_at` set in DB
+
+---
+
+## Phase 6 — Observability, Retry, Evaluation & README ✅
+**Goal:** Final polish — LangSmith tracing, retry logic, decision evaluation, docs.
+
+### Files Modified / Created
+| File | Change |
+|------|--------|
+| `config/tracing.py` | New: `init_tracing()` — sets LangSmith env vars before LangChain imports |
+| `api/main.py` | Added `init_tracing()` as first import |
+| `api/routes.py` | Added `GET /observability/status` endpoint |
+| `agents/decision.py` | Added `_call_llm_with_retry()` — retries on transient LLM exceptions |
+| `scripts/__init__.py` | New: empty file — makes scripts/ a proper package |
+| `scripts/evaluate_decisions.py` | New: accuracy/precision/recall vs 13-entry ground truth |
+| `tests/test_api.py` | Added `test_observability_status()` (10 tests total) |
+| `tests/test_decision.py` | Added `test_decision_retries_on_exception()` (5 tests total) |
+| `README.md` | New: full professional documentation |
+| `CLAUDE.md` | Added `## Evaluation` section |
+
+### Retry Design
+- `_call_llm_with_retry(llm, messages, max_retries=3, backoff_seconds=1.0)`
+- Retries only on LLM call **exceptions** (network, timeout, rate limit)
+- Parse failures handled by `_parse_llm_response()` — not retried (already safe)
+- `time.sleep` patched in test to avoid 2s backoff delay
+
+### LangSmith Tracing
+- `config/tracing.py` sets env vars before any LangChain import
+- `init_tracing()` called as the very first line in `api/main.py`
+- Tracing disabled gracefully when `LANGCHAIN_API_KEY` is a placeholder
+- `/observability/status` endpoint reports live tracing configuration
+
+### Decision Evaluation Results (llama3.1:8b, seed data)
+```
+Accuracy:          92.3%  (12/13 correct)
+Revoke Precision:  80.0%  (4/5 predicted revokes were correct)
+Revoke Recall:     100.0% (all 4 true revokes caught)
+
+Single mismatch:
+  Frank Lee | AWS Production Admin
+  Expected: escalate  (SoD but recently used — borderline)
+  Actual:   revoke    (model correctly identified SoD risk, over-confident)
+```
+
+### Final Test Suite
+```
+33 passed in 67s
+
+tests/test_api.py            10 tests  (includes observability test)
+tests/test_decision.py        5 tests  (includes retry test)
+tests/test_notifier.py        3 tests
+tests/test_audit.py           2 tests
+tests/test_risk_scorer.py     7 tests
+tests/test_harvester.py       3 tests
+tests/test_graph.py           2 tests
+tests/test_hitl_flow.py       1 test
+```

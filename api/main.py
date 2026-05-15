@@ -1,3 +1,6 @@
+from config.tracing import init_tracing
+init_tracing()   # must be before any langchain import
+
 from fastapi import FastAPI
 from api.routes import router
 

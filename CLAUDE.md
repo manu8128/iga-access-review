@@ -47,6 +47,10 @@ tests/           # pytest unit tests per agent
 - All LLM calls go through config/llm_config.py, never instantiate models directly
 - Use structlog for logging, not print()
 
+## Evaluation
+Run decision accuracy evaluation against ground truth:
+    python scripts/evaluate_decisions.py
+
 ## Testing rules
 - No mocking the core agent logic — test with real DB fixtures
 - Each agent must have at least one happy path and one failure test

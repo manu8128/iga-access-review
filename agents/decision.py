@@ -14,6 +14,7 @@ DB writes (single commit after all LLM calls):
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -66,6 +67,44 @@ def _parse_llm_response(content: str) -> tuple[str, str, float]:
         return decision, reasoning, confidence
     except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
         return "escalate", "parse error", 0.0
+
+
+def _call_llm_with_retry(
+    llm,
+    messages: list,
+    max_retries: int = 3,
+    backoff_seconds: float = 1.0,
+) -> tuple[str, str, float]:
+    """Call LLM with retry on transient exceptions (network, timeout, rate limit).
+
+    Attempts up to max_retries times. On each exception, waits
+    backoff_seconds before retrying. Parse failures are handled by
+    _parse_llm_response directly — those are not retried.
+
+    Args:
+        llm:             LangChain LLM instance
+        messages:        List of SystemMessage + HumanMessage
+        max_retries:     Maximum number of attempts (default 3)
+        backoff_seconds: Wait time between retries (default 1.0s)
+
+    Returns:
+        Tuple of (decision, reasoning, confidence)
+    """
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(messages)
+            decision, reasoning, confidence = _parse_llm_response(
+                response.content
+            )
+            # Return immediately on any valid parse result.
+            # _parse_llm_response already handles bad JSON safely.
+            return decision, reasoning, confidence
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(backoff_seconds)
+                continue
+            return "escalate", "llm call failed after retries", 0.0
+    return "escalate", "max retries exhausted", 0.0
 
 
 class DecisionAgent(BaseAgent):
@@ -121,13 +160,12 @@ class DecisionAgent(BaseAgent):
                     "flags": e["flags"],
                 }
 
-                response = self.llm.invoke([
+                messages = [
                     SystemMessage(content=SYSTEM_PROMPT),
                     HumanMessage(content=json.dumps(payload)),
-                ])
-
-                decision, reasoning, confidence = _parse_llm_response(
-                    response.content
+                ]
+                decision, reasoning, confidence = _call_llm_with_retry(
+                    self.llm, messages
                 )
 
                 self.log.info(

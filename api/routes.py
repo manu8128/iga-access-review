@@ -5,6 +5,7 @@ FastAPI route definitions for the IGA Access Review API.
 
 Endpoints:
   GET  /health                          — liveness check
+  GET  /observability/status            — LangSmith tracing status
   POST /campaigns                       — start a new campaign (202)
   GET  /campaigns/{campaign_id}         — poll campaign status
   GET  /campaigns/{campaign_id}/review  — list pending human-review items
@@ -73,6 +74,18 @@ class ResumeRequest(BaseModel):
 async def health() -> dict:
     """Liveness check."""
     return {"status": "ok", "service": "iga-access-review"}
+
+
+@router.get("/observability/status")
+async def observability_status() -> dict:
+    """Report LangSmith tracing configuration status."""
+    import os
+    tracing_enabled = os.environ.get("LANGCHAIN_TRACING_V2") == "true"
+    return {
+        "langsmith_tracing": tracing_enabled,
+        "langsmith_project": os.environ.get("LANGCHAIN_PROJECT", "not set"),
+        "langsmith_endpoint": os.environ.get("LANGCHAIN_ENDPOINT", "not set"),
+    }
 
 
 @router.post("/campaigns", status_code=202)
