@@ -12,6 +12,18 @@ architecture. Runs end-to-end access review campaigns with HITL checkpoints.
 - Docker Compose
 - LLM: Claude (Anthropic) or OpenAI — switchable via config/llm_config.py
 
+## LLM providers
+Switch provider with one line in .env — no code changes needed.
+| Provider  | LLM_MODEL example            | Key needed |
+|-----------|------------------------------|------------|
+| anthropic | claude-haiku-4-5-20251001         | Yes        |
+| openai    | gpt-4o-mini                  | Yes        |
+| google    | gemini-2.0-flash             | Yes (free) |
+| ollama    | llama3.1:8b                  | No         |
+
+Verify LLM works before running any phase:
+    python scripts/verify_llm.py
+
 ## Project structure
 agents/          # harvester, risk_scorer, decision, notifier, audit
 orchestrator/    # LangGraph state graph

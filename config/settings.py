@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
+    # Google Gemini
+    google_api_key: str = ""
+
+    # Ollama
+    ollama_base_url: str = "http://localhost:11434"
+
     # PostgreSQL — individual fields
     postgres_user: str = "iga_user"
     postgres_password: str = "iga_password"
