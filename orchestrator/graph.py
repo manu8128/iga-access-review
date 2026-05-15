@@ -8,18 +8,20 @@ Node execution order:
                                                       ↘ (no revokes) → notifier → audit
 
 The human_review node uses LangGraph interrupt() to pause execution
-pending human input. In Phase 2 this is a stub — real resume logic
-is implemented in Phase 5 using a PostgreSQL checkpointer.
+pending human input. State is persisted to PostgreSQL via PostgresSaver
+so campaigns can be resumed after server restarts.
 
-Checkpointer: MemorySaver (in-process, for Phase 2).
-              Will be swapped to AsyncPostgresSaver in Phase 5.
+Checkpointer: PostgresSaver (Phase 5) — state survives restarts.
+              Replaced MemorySaver from Phase 2.
 """
 from __future__ import annotations
 
+import psycopg
 import structlog
 from datetime import datetime, timezone
+from psycopg.rows import dict_row
 
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -28,9 +30,27 @@ from agents.decision import DecisionAgent
 from agents.harvester import HarvesterAgent
 from agents.notifier import NotifierAgent
 from agents.risk_scorer import RiskScorerAgent
+from config.settings import settings
 from orchestrator.state import CampaignState
 
 log = structlog.get_logger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Checkpointer helpers                                                         #
+# --------------------------------------------------------------------------- #
+
+
+def _build_postgres_conn_string() -> str:
+    """Build a psycopg-compatible connection string from settings."""
+    return (
+        f"host={settings.postgres_host} "
+        f"port={settings.postgres_port} "
+        f"dbname={settings.postgres_db} "
+        f"user={settings.postgres_user} "
+        f"password={settings.postgres_password}"
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Node functions                                                               #
@@ -53,28 +73,52 @@ def decision_node(state: CampaignState) -> dict:
 
 
 def human_review_node(state: CampaignState) -> dict:
-    """Pause the graph for human review of REVOKE decisions.
+    """Pause graph for human review of REVOKE decisions.
 
-    TODO Phase 5: Full HITL implementation.
-      - This interrupt() suspends graph execution and serialises state to the
-        PostgreSQL checkpointer (thread_id = campaign_id).
-      - The FastAPI endpoint POST /campaigns/{id}/resume will re-invoke the
-        graph with the human reviewer's decisions merged into state.
-      - On resume, this node receives the updated pending_human_review list
-        (with human_decision and human_reviewer filled in) and returns control
-        to the notifier node.
+    interrupt() serialises full state to PostgreSQL checkpointer.
+    Graph resumes when resume_campaign() is called with human decisions.
+    On resume, state["pending_human_review"] contains human_decision
+    and human_reviewer filled in by the reviewer.
     """
+    pending = state["pending_human_review"]
+
     log.info(
         "human_review_node: pausing for human review",
         campaign_id=state["campaign_id"],
-        pending_count=len(state["pending_human_review"]),
+        pending_count=len(pending),
     )
 
-    # Pause execution — LangGraph serialises state and waits for resume.
-    interrupt({"pending_human_review": state["pending_human_review"]})
+    # Update Campaign status to AWAITING_HUMAN in DB
+    from db.session import SessionLocal
+    from db.models import Campaign, CampaignStatus, AuditLog
+    db = SessionLocal()
+    try:
+        campaign = (
+            db.query(Campaign)
+            .filter(Campaign.langgraph_thread_id == state["campaign_id"])
+            .first()
+        )
+        if campaign:
+            campaign.status = CampaignStatus.AWAITING_HUMAN
+            db.add(AuditLog(
+                campaign_id=campaign.id,
+                event="awaiting_human_review",
+                detail=f"{len(pending)} revoke decisions pending human approval",
+                agent="human_review",
+                timestamp=datetime.utcnow(),
+            ))
+            db.commit()
+    finally:
+        db.close()
 
-    # Control returns here after graph.invoke() is called again with
-    # human decisions populated in state["pending_human_review"].
+    # Pause graph — state is persisted to PostgreSQL checkpointer
+    interrupt({"pending_human_review": pending})
+
+    # Resumes here after resume_campaign() is called
+    log.info(
+        "human_review_node: resumed after human review",
+        campaign_id=state["campaign_id"],
+    )
     return {}
 
 
@@ -143,14 +187,23 @@ _builder.add_edge("human_review", "notifier")
 _builder.add_edge("notifier", "audit")
 _builder.add_edge("audit", END)
 
-# Compile with MemorySaver checkpointer (Phase 2).
-# TODO Phase 5: replace with AsyncPostgresSaver for persistent HITL state.
-_checkpointer = MemorySaver()
+# Phase 5: PostgresSaver — state persists across server restarts.
+# Required for the HITL resume flow (interrupt → human review → resume).
+# autocommit=True is required for CREATE INDEX CONCURRENTLY in setup().
+# prepare_threshold=0 and row_factory=dict_row match PostgresSaver expectations.
+_conn = psycopg.connect(
+    _build_postgres_conn_string(),
+    autocommit=True,
+    prepare_threshold=0,
+    row_factory=dict_row,
+)
+_checkpointer = PostgresSaver(_conn)
+_checkpointer.setup()   # creates LangGraph checkpoint tables if not exist
 graph = _builder.compile(checkpointer=_checkpointer)
 
 
 # --------------------------------------------------------------------------- #
-# Public entry point                                                           #
+# Public entry points                                                          #
 # --------------------------------------------------------------------------- #
 
 
@@ -162,7 +215,7 @@ def run_campaign(campaign_id: str, campaign_name: str) -> CampaignState:
         campaign_name: Human-readable campaign name.
 
     Returns:
-        Final CampaignState after all nodes have executed.
+        Final CampaignState after all nodes have executed (or paused at HITL).
     """
     initial_state: CampaignState = {
         "campaign_id": campaign_id,
@@ -195,3 +248,81 @@ def run_campaign(campaign_id: str, campaign_name: str) -> CampaignState:
     )
 
     return result
+
+
+def get_campaign_state(campaign_id: str) -> CampaignState | None:
+    """Retrieve the current persisted state for a campaign thread.
+
+    Returns None if no state exists for the given campaign_id.
+    Used by FastAPI to check campaign status without re-running.
+    """
+    config = {"configurable": {"thread_id": campaign_id}}
+    state = graph.get_state(config)
+    if state and state.values:
+        return state.values
+    return None
+
+
+def resume_campaign(campaign_id: str, human_decisions: list[dict]) -> CampaignState:
+    """Resume a paused campaign after human review.
+
+    The graph is paused at human_review_node via interrupt().
+    This function merges human decisions into pending_human_review
+    and re-invokes the graph from the checkpoint.
+
+    Args:
+        campaign_id:      The campaign's langgraph_thread_id
+        human_decisions:  List of dicts with keys:
+                          entitlement_id, human_decision, human_reviewer
+
+    Returns:
+        Final CampaignState after completion.
+    """
+    config = {"configurable": {"thread_id": campaign_id}}
+
+    # Get current state from checkpointer
+    current = graph.get_state(config)
+    if not current or not current.values:
+        raise ValueError(f"No paused campaign found for id: {campaign_id}")
+
+    # Merge human decisions into pending_human_review
+    state = current.values
+    updated_pending = _merge_human_decisions(
+        state["pending_human_review"],
+        human_decisions,
+    )
+
+    # Update state in checkpointer with human decisions
+    graph.update_state(
+        config,
+        {"pending_human_review": updated_pending},
+        as_node="human_review",
+    )
+
+    # Re-invoke graph — it resumes from human_review_node
+    result: CampaignState = graph.invoke(None, config=config)
+    return result
+
+
+def _merge_human_decisions(
+    pending: list[dict],
+    human_decisions: list[dict],
+) -> list[dict]:
+    """Merge human reviewer decisions into pending_human_review list.
+
+    Matches on entitlement_id. Any pending item not in human_decisions
+    keeps human_decision=None (will be treated as escalate by notifier).
+    """
+    decision_map = {d["entitlement_id"]: d for d in human_decisions}
+    updated: list[dict] = []
+    for item in pending:
+        eid = item["entitlement_id"]
+        if eid in decision_map:
+            updated.append({
+                **item,
+                "human_decision": decision_map[eid]["human_decision"],
+                "human_reviewer": decision_map[eid]["human_reviewer"],
+            })
+        else:
+            updated.append(item)
+    return updated
