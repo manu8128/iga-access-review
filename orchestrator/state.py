@@ -4,8 +4,12 @@ orchestrator/state.py
 CampaignState TypedDict — the single source of truth passed between
 every node in the LangGraph StateGraph.
 
-The four list fields use Annotated[list[dict], operator.add] so that
+Three list fields use Annotated[list[dict], operator.add] so that
 LangGraph merges partial state updates by appending rather than replacing.
+pending_human_review uses plain list[dict] (last-write-wins) because it
+is written once by DecisionAgent and then updated in place by
+resume_campaign() — an append reducer would double the list on
+graph.update_state() calls.
 All other fields use last-write-wins (default LangGraph behaviour).
 """
 from __future__ import annotations
@@ -41,7 +45,10 @@ class CampaignState(TypedDict):
     # Each dict carries all decision keys plus:
     #   human_decision: str | None  (None until reviewed)
     #   human_reviewer: str | None  (None until reviewed)
-    pending_human_review: Annotated[list[dict], operator.add]
+    # Uses last-write-wins (no reducer) because this field is written
+    # once by DecisionAgent and updated in place by resume_campaign().
+    # An append reducer would double the list on graph.update_state() calls.
+    pending_human_review: list[dict]
 
     # Notifier output flag
     notified: bool

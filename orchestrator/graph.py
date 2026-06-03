@@ -312,10 +312,22 @@ def _merge_human_decisions(
 
     Matches on entitlement_id. Any pending item not in human_decisions
     keeps human_decision=None (will be treated as escalate by notifier).
+    Deduplicates by entitlement_id before merging to guard against
+    any double-append edge cases.
     """
+    # Deduplicate pending by entitlement_id — guards against
+    # any residual doubling from previous append reducer behaviour
+    seen: set[str] = set()
+    deduped_pending: list[dict] = []
+    for item in pending:
+        eid = item["entitlement_id"]
+        if eid not in seen:
+            seen.add(eid)
+            deduped_pending.append(item)
+
     decision_map = {d["entitlement_id"]: d for d in human_decisions}
     updated: list[dict] = []
-    for item in pending:
+    for item in deduped_pending:
         eid = item["entitlement_id"]
         if eid in decision_map:
             updated.append({
