@@ -8,6 +8,7 @@ NotifierAgent has no DB writes so no DB mock is needed.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
 from unittest.mock import MagicMock, call
@@ -150,3 +151,32 @@ def test_notifier_continues_on_parse_error() -> None:
     assert result.get("error") is None
     # Both managers were attempted
     assert agent._llm.invoke.call_count == 2
+
+
+def test_notifier_uses_effective_decision_when_human_overrides() -> None:
+    """Notifier sends effective_decision=approve when human overrides an AI revoke."""
+    decision = _fake_decision(ai_decision="revoke")
+
+    agent = _mock_agent(_VALID_EMAIL_JSON)
+
+    state: CampaignState = {
+        **_make_state([decision]),
+        "pending_human_review": [{
+            **decision,
+            "human_decision": "approve",
+            "human_reviewer": "reviewer@acme.com",
+        }],
+    }
+
+    result = agent.run(state)
+
+    assert result["notified"] is True
+
+    # Inspect the payload sent to the LLM
+    messages = agent._llm.invoke.call_args[0][0]
+    payload = json.loads(messages[1].content)  # HumanMessage is index 1
+    decisions_sent = payload["decisions"]
+    assert len(decisions_sent) == 1
+    assert decisions_sent[0]["effective_decision"] == "approve"
+    assert decisions_sent[0]["ai_overridden"] is True
+    assert decisions_sent[0]["human_reviewed"] is True

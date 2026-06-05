@@ -171,6 +171,36 @@ async def resume_campaign_endpoint(
             ),
         )
 
+    # Guard against double-resume — reject if all decisions already submitted
+    pending = state.get("pending_human_review", [])
+    already_reviewed = all(
+        p.get("human_decision") is not None for p in pending
+    ) if pending else False
+    if already_reviewed:
+        raise HTTPException(
+            status_code=409,
+            detail="All pending decisions have already been reviewed. "
+                   "Campaign should be resuming or completed.",
+        )
+
+    # Validate all pending items have a decision submitted
+    submitted_ids = {d.entitlement_id for d in request.decisions}
+    pending_ids = {p["entitlement_id"] for p in pending}
+    missing_ids = pending_ids - submitted_ids
+
+    if missing_ids:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    f"Decisions missing for {len(missing_ids)} "
+                    f"pending entitlement(s). Submit decisions for "
+                    f"all pending items in a single call."
+                ),
+                "missing_entitlement_ids": list(missing_ids),
+            },
+        )
+
     human_decisions = [d.model_dump() for d in request.decisions]
     background_tasks.add_task(resume_campaign, campaign_id, human_decisions)
 

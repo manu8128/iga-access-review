@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from agents.audit import AuditAgent
-from db.models import CampaignStatus
+from db.models import Campaign, CampaignStatus, EntitlementDecision, EntitlementReview
 from orchestrator.state import CampaignState
 
 
@@ -128,3 +128,44 @@ def test_audit_writes_one_log_per_decision() -> None:
 
     # db.commit() must have been called exactly once
     agent._db.commit.assert_called_once()
+
+
+def test_audit_writes_human_decisions_to_entitlement_reviews() -> None:
+    """AuditAgent updates EntitlementReview rows with human_decision/reviewer/reviewed_at."""
+    decision = _fake_decision("revoke")
+    eid = decision["entitlement_id"]
+
+    agent = AuditAgent()
+
+    mock_campaign = MagicMock()
+    mock_campaign.id = uuid.UUID("00000000-0000-0000-0000-000000000002")
+
+    mock_review_row = MagicMock()
+
+    # db.query() must return different chains for Campaign vs EntitlementReview
+    def _query_side_effect(model):
+        m = MagicMock()
+        if model is Campaign:
+            m.filter.return_value.first.return_value = mock_campaign
+        elif model is EntitlementReview:
+            m.filter.return_value.first.return_value = mock_review_row
+        return m
+
+    agent._db = MagicMock()
+    agent._db.query.side_effect = _query_side_effect
+
+    state: CampaignState = {
+        **_make_state([decision]),
+        "pending_human_review": [{
+            **decision,
+            "human_decision": "approve",
+            "human_reviewer": "manager@acme.com",
+        }],
+    }
+
+    result = agent.run(state)
+
+    assert result["status"] == "completed"
+    assert mock_review_row.human_decision == EntitlementDecision("approve")
+    assert mock_review_row.human_reviewer == "manager@acme.com"
+    assert mock_review_row.reviewed_at is not None

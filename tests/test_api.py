@@ -196,3 +196,32 @@ def test_observability_status() -> None:
     data = response.json()
     assert "langsmith_tracing" in data
     assert "langsmith_project" in data
+
+
+# --------------------------------------------------------------------------- #
+# POST /campaigns/{campaign_id}/resume — partial submission guard             #
+# --------------------------------------------------------------------------- #
+
+def test_resume_rejects_partial_decisions() -> None:
+    """Resume endpoint returns 422 when not all pending items have decisions submitted."""
+    pending = [
+        {"entitlement_id": "eid-1", "human_decision": None, "human_reviewer": None},
+        {"entitlement_id": "eid-2", "human_decision": None, "human_reviewer": None},
+        {"entitlement_id": "eid-3", "human_decision": None, "human_reviewer": None},
+    ]
+    fake = _fake_state(status="deciding", pending=pending)
+    with patch("api.routes.get_campaign_state", return_value=fake):
+        response = client.post(
+            "/campaigns/test-campaign-id/resume",
+            json={"decisions": [
+                {
+                    "entitlement_id": "eid-1",
+                    "human_decision": "approve",
+                    "human_reviewer": "reviewer@acme.com",
+                }
+            ]},
+        )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "missing_entitlement_ids" in detail
+    assert len(detail["missing_entitlement_ids"]) == 2

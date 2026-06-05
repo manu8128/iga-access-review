@@ -7,6 +7,9 @@ Groups decisions by manager_email and makes one LLM call per manager
 to draft a professional access review summary email. Emails are logged
 but NOT sent — actual dispatch will be wired in Phase 5.
 
+Uses effective_decision (human override if present, otherwise ai_decision)
+so manager emails reflect the final outcome after HITL review.
+
 Resilient: parse failure for any one manager is logged and skipped;
 the campaign is not aborted.
 """
@@ -30,8 +33,11 @@ if TYPE_CHECKING:
 
 SYSTEM_PROMPT = """You are an access review notification agent. Draft a professional \
 email to a manager summarising their team's access review decisions. \
-Be concise, factual, and action-oriented. List revoke decisions \
-prominently — these require manager awareness. \
+Be concise, factual, and action-oriented. Use effective_decision as \
+the final decision for each entitlement — this reflects any human \
+review overrides. Where ai_overridden is true, note that the \
+AI recommendation was reviewed and overridden by a human reviewer. \
+List any remaining revoke decisions prominently. \
 Respond with valid JSON only."""
 
 # Keys included in the per-decision payload sent to the LLM
@@ -67,6 +73,15 @@ class NotifierAgent(BaseAgent):
 
         try:
             # ---------------------------------------------------------------- #
+            # Build human decision lookup from pending_human_review            #
+            # ---------------------------------------------------------------- #
+            human_review_map: dict[str, dict] = {
+                p["entitlement_id"]: p
+                for p in state.get("pending_human_review", [])
+                if p.get("human_decision") is not None
+            }
+
+            # ---------------------------------------------------------------- #
             # Group decisions by manager_email (skip None emails)              #
             # ---------------------------------------------------------------- #
             groups: dict[str, list[dict]] = defaultdict(list)
@@ -84,10 +99,22 @@ class NotifierAgent(BaseAgent):
             # One LLM call per manager                                         #
             # ---------------------------------------------------------------- #
             for manager_email, manager_decisions in groups.items():
-                compact_decisions = [
-                    {k: d[k] for k in _DECISION_KEYS if k in d}
-                    for d in manager_decisions
-                ]
+                compact_decisions: list[dict] = []
+                for d in manager_decisions:
+                    human_info = human_review_map.get(d.get("entitlement_id", ""))
+                    effective = (
+                        human_info["human_decision"]
+                        if human_info else d["ai_decision"]
+                    )
+                    was_overridden = (
+                        human_info is not None
+                        and human_info["human_decision"] != d["ai_decision"]
+                    )
+                    entry = {k: d[k] for k in _DECISION_KEYS if k in d}
+                    entry["effective_decision"] = effective
+                    entry["human_reviewed"] = human_info is not None
+                    entry["ai_overridden"] = was_overridden
+                    compact_decisions.append(entry)
 
                 payload = {
                     "manager_email": manager_email,
